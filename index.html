@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Whisper WebGPU Recorder</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background-color: #111827; color: white; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; min-height: 100vh; margin: 0; padding: 20px; }
+        
+        /* Visualizer Box */
+        .visualizer-container {
+            width: 100%; max-width: 600px; height: 120px;
+            background: #1f2937; border-radius: 8px; margin-top: 20px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); overflow: hidden;
+            border: 1px solid #374151;
+        }
+        canvas { width: 100%; height: 100%; }
+
+        /* Transcript Box */
+        #output {
+            width: 100%; max-width: 600px; min-height: 200px; max-height: 400px;
+            overflow-y: auto; background: #1f2937; border: 1px solid #374151;
+            border-radius: 8px; padding: 15px; margin-top: 20px;
+            white-space: pre-wrap; color: #e5e7eb; font-family: monospace; line-height: 1.5;
+        }
+
+        /* Controls */
+        select, button { height: 42px; }
+        select { background-color: #374151; color: white; border: 1px solid #4b5563; padding: 0 10px; border-radius: 6px; cursor: pointer; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+
+    <h1 class="text-3xl font-bold mb-6 tracking-tight">Whisper WebGPU</h1>
+
+    <div class="flex flex-wrap gap-3 mb-2 justify-center w-full max-w-2xl">
+        <select id="audioSource" class="flex-grow md:flex-grow-0">
+            <option value="mic">Microphone</option>
+            <option value="system">System Audio / Tab</option>
+        </select>
+        
+        <button id="recordBtn" class="bg-blue-600 hover:bg-blue-700 text-white font-bold px-6 rounded transition-colors flex-grow">
+            Load Model
+        </button>
+    </div>
+
+    <div id="status" class="text-gray-400 text-sm h-6 mb-2 font-mono"></div>
+
+    <div class="visualizer-container">
+        <canvas id="visualizer"></canvas>
+    </div>
+
+    <div id="output"></div>
+
+    <div class="flex gap-4 mt-4 w-full max-w-2xl hidden" id="exportControls">
+        <button onclick="downloadText()" class="flex-1 bg-gray-700 hover:bg-gray-600 text-white font-medium rounded border border-gray-600">
+            Save Text
+        </button>
+        <button onclick="downloadAudio()" id="dlAudioBtn" disabled class="flex-1 bg-gray-700 hover:bg-gray-600 text-white font-medium rounded border border-gray-600">
+            Save Audio
+        </button>
+    </div>
+
+    <script type="module">
+        /**
+         * 1. THE WORKER (AI LOGIC)
+         * We write the worker code as a string and create a Blob URL.
+         * This tricks the browser into thinking it's a separate file.
+         */
+        const workerCode = `
+            import { pipeline } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.0-alpha.19/dist/transformers.min.js';
+            
+            // CONFIG
+            const MODEL_ID = 'onnx-community/whisper-base';
+            let transcriber = null;
+
+            self.addEventListener('message', async (event) => {
+                const { type, audio } = event.data;
+
+                if (type === 'load') {
+                    try {
+                        self.postMessage({ status: 'loading', message: 'Downloading Model (~200MB)...' });
+                        
+                        // Load Model
+                        transcriber = await pipeline('automatic-speech-recognition', MODEL_ID, {
+                            device: 'webgpu',
+                            dtype: { encoder_model: 'fp32', decoder_model_merged: 'q4' },
+                        });
+
+                        self.postMessage({ status: 'ready', message: 'Ready to Record' });
+                    } catch (err) {
+                        self.postMessage({ status: 'error', message: err.message });
+                    }
+                }
+
+                if (type === 'process' && transcriber) {
+                    try {
+                        const output = await transcriber(audio, {
+                            language: 'en', task: 'transcribe',
+                            chunk_length_s: 30, stride_length_s: 5,
+                        });
+                        self.postMessage({ status: 'result', text: output.text });
+                    } catch (e) { console.error(e); }
+                }
+            });
+        `;
+
+        // Create the worker from the string above
+        const workerBlob = new Blob([workerCode], { type: 'application/javascript' });
+        const workerUrl = URL.createObjectURL(workerBlob);
+        const worker = new Worker(workerUrl, { type: 'module' });
+
+
+        /**
+         * 2. THE UI LOGIC
+         */
+        const recordBtn = document.getElementById('recordBtn');
+        const statusEl = document.getElementById('status');
+        const outputEl = document.getElementById('output');
+        const exportControls = document.getElementById('exportControls');
+        const dlAudioBtn = document.getElementById('dlAudioBtn');
+        const audioSourceSelect = document.getElementById('audioSource');
+        const canvas = document.getElementById('visualizer');
+        const ctx = canvas.getContext('2d');
+        
+        let isRecording = false;
+        let audioContext, stream, mediaRecorder, audioChunks = [], audioBlobURL;
+        let analyser, dataArray, audioWorkletNode, audioBuffer = [];
+        let processingInterval, animationId;
+
+        // Handle Worker Messages
+        worker.onmessage = (e) => {
+            const { status, message, text } = e.data;
+            if (status === 'loading') {
+                statusEl.innerText = message;
+                recordBtn.disabled = true;
+                recordBtn.innerText = "Loading...";
+            } else if (status === 'ready') {
+                statusEl.innerText = "";
+                recordBtn.innerText = "Start Recording";
+                recordBtn.disabled = false;
+                recordBtn.onclick = toggleRecording;
+            } else if (status === 'result') {
+                outputEl.innerText = text;
+            } else if (status === 'error') {
+                statusEl.innerText = "Error: " + message;
+                statusEl.classList.add('text-red-500');
+            }
+        };
+
+        // Trigger Model Load on First Click (Usually automatic, but good to have manual control)
+        recordBtn.onclick = () => {
+            worker.postMessage({ type: 'load' });
+        };
+
+        async function toggleRecording() {
+            if (!isRecording) {
+                try {
+                    await startRecording();
+                    recordBtn.innerText = "Stop Recording";
+                    recordBtn.classList.replace('bg-blue-600', 'bg-red-600');
+                    recordBtn.classList.replace('hover:bg-blue-700', 'hover:bg-red-700');
+                    exportControls.classList.add('hidden');
+                    audioSourceSelect.disabled = true;
+                    isRecording = true;
+                } catch (err) {
+                    alert("Could not start recording: " + err.message);
+                }
+            } else {
+                stopRecording();
+                recordBtn.innerText = "Start Recording";
+                recordBtn.classList.replace('bg-red-600', 'bg-blue-600');
+                recordBtn.classList.replace('hover:bg-red-700', 'hover:bg-blue-700');
+                exportControls.classList.remove('hidden');
+                audioSourceSelect.disabled = false;
+                isRecording = false;
+            }
+        }
+
+        async function startRecording() {
+            audioContext = new AudioContext({ sampleRate: 16000 });
+            
+            // 1. Get the Stream (Mic or System)
+            const sourceVal = audioSourceSelect.value;
+            if (sourceVal === 'mic') {
+                stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
+            } else {
+                // For System Audio, we use getDisplayMedia
+                stream = await navigator.mediaDevices.getDisplayMedia({ 
+                    video: { displaySurface: "browser" }, 
+                    audio: true 
+                });
+            }
+            
+            const source = audioContext.createMediaStreamSource(stream);
+            
+            // 2. Setup Visualizer
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = 2048;
+            source.connect(analyser);
+            dataArray = new Uint8Array(analyser.frequencyBinCount);
+            drawVisualizer();
+
+            // 3. Setup File Recorder (to save .webm)
+            audioChunks = [];
+            mediaRecorder = new MediaRecorder(stream);
+            mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+            mediaRecorder.onstop = () => {
+                const blob = new Blob(audioChunks, { type: 'audio/webm' });
+                audioBlobURL = URL.createObjectURL(blob);
+                dlAudioBtn.disabled = false;
+            };
+            mediaRecorder.start();
+
+            // 4. Setup AI Processor (AudioWorklet)
+            // We create this inline to avoid needing a separate file
+            const processorCode = `
+                class RecorderProcessor extends AudioWorkletProcessor {
+                    process(inputs) {
+                        const input = inputs[0];
+                        if (input.length > 0) this.port.postMessage(input[0]);
+                        return true;
+                    }
+                }
+                registerProcessor('recorder-processor', RecorderProcessor);
+            `;
+            await audioContext.audioWorklet.addModule(URL.createObjectURL(new Blob([processorCode], { type: 'text/javascript' })));
+            
+            audioWorkletNode = new AudioWorkletNode(audioContext, 'recorder-processor');
+            source.connect(audioWorkletNode);
+            audioWorkletNode.connect(audioContext.destination);
+
+            audioWorkletNode.port.onmessage = (e) => {
+                const chunk = e.data;
+                audioBuffer.push(...chunk);
+                // Keep buffer size manageable (30 seconds)
+                if (audioBuffer.length > 16000 * 30) {
+                    audioBuffer = audioBuffer.slice(-(16000 * 30));
+                }
+            };
+
+            // Send audio to worker every 500ms
+            processingInterval = setInterval(() => {
+                if (audioBuffer.length > 0) {
+                    worker.postMessage({ 
+                        type: 'process', 
+                        audio: new Float32Array(audioBuffer) 
+                    });
+                }
+            }, 500);
+        }
+
+        function stopRecording() {
+            clearInterval(processingInterval);
+            cancelAnimationFrame(animationId);
+            
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+            if (stream) stream.getTracks().forEach(t => t.stop());
+            if (audioContext) audioContext.close();
+            
+            // Clear Visualizer
+            ctx.fillStyle = '#1f2937';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            audioBuffer = [];
+        }
+
+        function drawVisualizer() {
+            animationId = requestAnimationFrame(drawVisualizer);
+            analyser.getByteTimeDomainData(dataArray);
+            
+            ctx.fillStyle = '#1f2937';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.lineWidth = 2;
+            ctx.strokeStyle = '#3b82f6'; // Blue-500
+            ctx.beginPath();
+            
+            const sliceWidth = canvas.width / dataArray.length;
+            let x = 0;
+            
+            for(let i = 0; i < dataArray.length; i++) {
+                const v = dataArray[i] / 128.0;
+                const y = v * canvas.height / 2;
+                if(i===0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                x += sliceWidth;
+            }
+            ctx.lineTo(canvas.width, canvas.height/2);
+            ctx.stroke();
+        }
+
+        // --- Export Functions ---
+        window.downloadText = () => {
+            if (!outputEl.innerText) return alert("No text to save!");
+            const blob = new Blob([outputEl.innerText], {type: 'text/plain'});
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'transcript.txt';
+            a.click();
+        }
+
+        window.downloadAudio = () => {
+            if(!audioBlobURL) return alert("No audio recorded!");
+            const a = document.createElement('a');
+            a.href = audioBlobURL;
+            a.download = 'recording.webm';
+            a.click();
+        }
+
+        // Resize Canvas
+        const resize = () => {
+            const container = canvas.parentElement;
+            canvas.width = container.offsetWidth;
+            canvas.height = container.offsetHeight;
+        };
+        window.addEventListener('resize', resize);
+        setTimeout(resize, 100);
+
+        // Start model load immediately
+        worker.postMessage({ type: 'load' });
+    </script>
+</body>
+</html>
